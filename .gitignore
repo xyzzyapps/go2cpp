@@ -3,6 +3,7 @@
 *.swp
 *.tmp
 go2cpp
+go2cpp.exe
 include.txt
 main
 main.cpp

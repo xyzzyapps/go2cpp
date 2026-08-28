@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -65,20 +66,162 @@ var includeMap = map[string]string{
 	"std::regex_replace":               "regex",
 	"std::regex_constants":             "regex",
 	"std::to_string":                   "string",
+	"std::ostringstream":               "sstream",
+	"std::true_type":                   "type_traits",
+	"std::false_type":                  "type_traits",
+	"std::decay_t":                     "type_traits",
+	"std::declval":                     "utility",
+	"std::thread":                      "thread",
+	"std::this_thread":                 "thread",
+	"std::chrono":                      "chrono",
+	"std::deque":                       "deque",
+	"std::mutex":                       "mutex",
+	"std::unique_lock":                 "mutex",
+	"std::lock_guard":                  "mutex",
+	"std::condition_variable":          "condition_variable",
+	"std::pair":                        "utility",
+	"std::move":                        "utility",
+	"std::copy":                        "algorithm",
+	"std::min":                         "algorithm",
+	"exit(":                            "cstdlib",
 	// TODO: complex64, complex128
 }
 
 var endings = []string{"{", ",", "}", ":"}
+
+// C++ function definitions inside a const cpp block: name(args) { or
+// name(args) -> rettype {
+var cppFuncDeclRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;{}()]*)\)\s*(?:->\s*[\w:<>&*\s]+)?\{`)
+
+// extractCppBlocks finds package-level `const cpp = ` + raw string
+// constants. It returns the combined C++ code, the set of line indices the
+// constants occupy (which are skipped during the line transformation), and
+// the names of the functions declared in the C++ code. Go functions with
+// these names are not transpiled; the C++ definitions are used instead.
+func extractCppBlocks(source string) (string, map[int]bool, []string) {
+	var code strings.Builder
+	cppLines := map[int]bool{}
+	lines := strings.Split(source, "\n")
+	inBlock := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !inBlock {
+			if strings.HasPrefix(trimmed, "const cpp =") || strings.HasPrefix(trimmed, "const cpp=") {
+				cppLines[i] = true
+				if idx := strings.Index(line, "`"); idx >= 0 {
+					rest := line[idx+1:]
+					if end := strings.Index(rest, "`"); end >= 0 {
+						code.WriteString(rest[:end])
+						code.WriteString("\n")
+					} else {
+						code.WriteString(rest)
+						code.WriteString("\n")
+						inBlock = true
+					}
+				}
+			}
+			continue
+		}
+		// Inside the raw string constant
+		cppLines[i] = true
+		if idx := strings.Index(line, "`"); idx >= 0 {
+			code.WriteString(line[:idx])
+			code.WriteString("\n")
+			inBlock = false
+		} else {
+			code.WriteString(line)
+			code.WriteString("\n")
+		}
+	}
+	codeStr := code.String()
+	var funcNames []string
+	if codeStr != "" {
+		seen := map[string]bool{}
+		for _, m := range cppFuncDeclRe.FindAllStringSubmatch(codeStr, -1) {
+			if !seen[m[1]] {
+				seen[m[1]] = true
+				funcNames = append(funcNames, m[1])
+			}
+		}
+	}
+	return codeStr, cppLines, funcNames
+}
+
+// functionDeclName returns the name of the function declared on a line
+// starting with "func", or an empty string for methods and other lines.
+func functionDeclName(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "func ") {
+		return ""
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "func "))
+	if strings.HasPrefix(rest, "(") || !strings.Contains(rest, "(") {
+		// Method receiver or malformed line
+		return ""
+	}
+	return strings.TrimSpace(rest[:strings.Index(rest, "(")])
+}
+
+// spliceCppBlock inserts the raw C++ code from const cpp blocks right after
+// the include block of the generated program, so that it is defined before
+// both the shims and the transpiled code, and is never processed by the
+// whole-program passes.
+func spliceCppBlock(output, cppBlock string) string {
+	if cppBlock == "" {
+		return output
+	}
+	lines := strings.Split(output, "\n")
+	idx := 0
+	for idx < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[idx]), "#include") {
+		idx++
+	}
+	parts := append([]string{}, lines[:idx]...)
+	parts = append(parts, strings.Split(strings.TrimRight(cppBlock, "\n"), "\n")...)
+	parts = append(parts, lines[idx:]...)
+	return strings.Join(parts, "\n")
+}
 
 var (
 	switchExpressionCounter = -1
 	firstCase               bool
 	switchLabel             string
 	labelCounter            int
-	iotaNumber              int // used for simple increases of iota constants
+	iotaNumber              int    // used for simple increases of iota constants
+	iotaFirstLine           bool   // true until the first line of a const block has been processed
+	lastConstExpr           string // right-hand side of the previous const line, for implicit repetition
 	deferCounter            int
 	unfinishedDeferFunction bool
 )
+
+// Go slice expressions like s[a:b], s[a:], s[:b] and s[:] on identifiers
+var sliceExpression = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\[([^\[\]:]*):([^\[\]:]*)\]`)
+
+// Go append with a spread argument, after the append rename: _go2cpp_append(x, y...)
+var appendSpreadExpression = regexp.MustCompile(`_go2cpp_append\(([^,()]+), ([^,()]+?)\.\.\.\)`)
+
+// Go channel receive on an identifier: <-ch
+var channelReceiveExpression = regexp.MustCompile(`<-\s*([A-Za-z_][A-Za-z0-9_]*)`)
+
+// The word "iota" inside a const expression
+var iotaWord = regexp.MustCompile(`\biota\b`)
+
+// RewriteSlices rewrites Go slice expressions, append with a spread argument
+// and channel receives to calls to the C++ shim functions.
+func RewriteSlices(source string) string {
+	source = appendSpreadExpression.ReplaceAllString(source, "_go2cpp_appendSpread($1, $2)")
+	source = channelReceiveExpression.ReplaceAllString(source, "$1.recv()")
+	return sliceExpression.ReplaceAllStringFunc(source, func(match string) string {
+		parts := sliceExpression.FindStringSubmatch(match)
+		name, from, to := parts[1], strings.TrimSpace(parts[2]), strings.TrimSpace(parts[3])
+		if from == "" {
+			from = "0"
+		}
+		if to == "" {
+			to = name + ".size()"
+		}
+		return "_go2cpp_slice(" + name + ", " + from + ", " + to + ")"
+	})
+}
 
 // between returns the string between two given strings, or the original string
 // firstA specifies if the first or last instance of a should be used
@@ -191,10 +334,17 @@ func WholeProgramReplace(source string) (output string) {
 		"make([]float32, ": "std::vector<" + TypeReplace("float32") + "> (",
 		"-> []string":      "-> std::vector<" + TypeReplace("string") + ">",
 		"-> []int":         "-> std::vector<" + TypeReplace("int") + ">",
-		"-> []uint":        "-> std::vector<" + TypeReplace("uint") + ">",
-		"-> []float64":     "-> std::vector<" + TypeReplace("float64") + ">",
-		"-> []float32":     "-> std::vector<" + TypeReplace("float32") + ">",
 		"= nil)":           "= std::nullopt)",
+		"fmt.Sprintf(":     "fmtSprintf(",
+		"fmt.Sprint(":      "fmtSprint(",
+		"os.Exit(":         "exit(",
+		"time.Sleep(":      "timeSleep(",
+		"time.Second":      "1000",
+		"time.Millisecond": "1",
+		" append(":         " _go2cpp_append(",
+		"\nappend(":        "\n_go2cpp_append(",
+		" copy(":           " _go2cpp_copy(",
+		"\ncopy(":          "\n_go2cpp_copy(",
 	}
 	for k, v := range replacements {
 		output = strings.Replace(output, k, v, -1)
@@ -202,33 +352,34 @@ func WholeProgramReplace(source string) (output string) {
 	return initializeVariables(output)
 }
 
+// ShimCode associates a trigger string with C++ code that is prepended to
+// the generated program when the trigger string is found in it.
+type ShimCode struct {
+	trigger string
+	code    string
+}
+
 func AddFunctions(source string, useFormatOutput, haveStructs bool) (output string) {
 
-	// TODO: Make the fmtSprintf implementation more watertight. Use variadic templates and parameter packs, while waiting for std::format to arrive in the C++20 implementations.
+	// The shims are checked in order. Shims that call other shims must come
+	// after the shims they depend on, since the code of each shim is scanned
+	// by the triggers of the shims that come after it.
 
 	output = source
-	replacements := map[string]string{
-		"strconv.ParseFloat": `using error = std::optional<std::string>;
-auto strconvParseFloat(std::string s, int bitSize) -> std::tuple<double, error> {
-	try {
-		return std::tuple { std::stod(s), std::nullopt };
-	} catch (const std::invalid_argument& ia) {
-		return std::tuple { 0.0, std::optional { "invalid argument" } };
-	}
-}
-`,
-		"strconv.ParseInt": `using error = std::optional<std::string>;
-auto strconvParseInt(std::string s, int base, int bitSize) -> std::tuple<int, error> {
-	try {
-		return std::tuple { std::stoi(s), std::nullopt };
-	} catch (const std::invalid_argument& ia) {
-		return std::tuple { 0.0, std::optional { "invalid argument" } };
-	}
-}
-`,
-		"strings.Contains":  `inline auto stringsContains(std::string const& haystack, std::string const& needle) -> bool { return haystack.find(needle) != std::string::npos; }`,
-		"strings.HasPrefix": `inline auto stringsHasPrefix(std::string const& haystack, std::string const& prefix) -> auto { return 0 == haystack.find(prefix); }`,
-		"_format_output": `template<typename T>
+
+	simpleFormatOutput := `template <typename T> void _format_output(std::ostream& out, T x)
+{
+    if constexpr (std::is_same<T, bool>::value) {
+        out << std::boolalpha << x << std::noboolalpha;
+    } else if constexpr (std::is_integral<T>::value) {
+        out << static_cast<int>(x);
+    } else {
+        out << x;
+    }
+}`
+
+	shims := []ShimCode{
+		{trigger: "_format_output", code: `template<typename T>
 using _str_t = decltype( std::declval<T&>()._str() );
 
 template<typename T>
@@ -247,76 +398,193 @@ template <typename T> void _format_output(std::ostream& out, T x)
     } else {
         out << x;
     }
-}`,
-		"strings.TrimSpace": `inline auto stringsTrimSpace(std::string const& s) -> std::string { std::string news {}; for (auto l : s) { if (l != ' ' && l != '\n' && l != '\t' && l != '\v' && l != '\f' && l != '\r') { news += l; } } return news; }`,
-		"fmt.Sprintf": `
-template <typename T>
-std::string fmtSprintf(const std::string& fmt, T arg1)
-{
-    std::string tmp = fmt;
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg1), std::regex_constants::format_first_only);
-    return tmp;
+}`},
+		{trigger: "strconv.Itoa", code: `inline auto strconvItoa(int x) -> std::string { return std::to_string(x); }`},
+		{trigger: "strconv.ParseFloat", code: `using error = std::optional<std::string>;
+auto strconvParseFloat(std::string s, int bitSize) -> std::tuple<double, error> {
+	try {
+		return std::tuple { std::stod(s), std::nullopt };
+	} catch (const std::invalid_argument& ia) {
+		return std::tuple { 0.0, std::optional { "invalid argument" } };
+	}
 }
-template <typename T>
-std::string fmtSprintf(const std::string& fmt, T arg1, T arg2)
-{
-    std::string tmp = fmt;
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg1), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg2), std::regex_constants::format_first_only);
-    return tmp;
+`},
+		{trigger: "strconv.ParseInt", code: `using error = std::optional<std::string>;
+auto strconvParseInt(std::string s, int base, int bitSize) -> std::tuple<int, error> {
+	try {
+		return std::tuple { std::stoi(s), std::nullopt };
+	} catch (const std::invalid_argument& ia) {
+		return std::tuple { 0.0, std::optional { "invalid argument" } };
+	}
 }
+`},
+		{trigger: "strings.Contains", code: `inline auto stringsContains(std::string const& haystack, std::string const& needle) -> bool { return haystack.find(needle) != std::string::npos; }`},
+		{trigger: "strings.HasPrefix", code: `inline auto stringsHasPrefix(std::string const& haystack, std::string const& prefix) -> auto { return 0 == haystack.find(prefix); }`},
+		{trigger: "strings.HasSuffix", code: `inline auto stringsHasSuffix(std::string const& haystack, std::string const& suffix) -> bool { return haystack.size() >= suffix.size() && 0 == haystack.compare(haystack.size() - suffix.size(), suffix.size(), suffix); }`},
+		{trigger: "strings.Index", code: `inline auto stringsIndex(std::string const& haystack, std::string const& needle) -> int { std::size_t pos = haystack.find(needle); return pos == std::string::npos ? -1 : static_cast<int>(pos); }`},
+		{trigger: "strings.Join", code: `inline auto stringsJoin(std::vector<std::string> const& elems, std::string const& sep) -> std::string { std::string out; for (std::size_t i = 0; i < elems.size(); ++i) { if (i > 0) { out += sep; } out += elems[i]; } return out; }`},
+		{trigger: "strings.ReplaceAll", code: `inline auto stringsReplaceAll(std::string s, std::string const& from, std::string const& to) -> std::string { if (from.empty()) { return s; } std::size_t pos = 0; while ((pos = s.find(from, pos)) != std::string::npos) { s.replace(pos, from.size(), to); pos += to.size(); } return s; }`},
+		{trigger: "strings.Replace", code: `inline auto stringsReplace(std::string s, std::string const& from, std::string const& to, int count) -> std::string { if (count < 0) { count = static_cast<int>(s.size()) + 1; } if (from.empty()) { return s; } std::size_t pos = 0; for (int i = 0; i < count; ++i) { pos = s.find(from, pos); if (pos == std::string::npos) { break; } s.replace(pos, from.size(), to); pos += to.size(); } return s; }`},
+		{trigger: "strings.SplitN", code: `inline auto stringsSplitN(std::string const& s, std::string const& sep, int n) -> std::vector<std::string> { std::vector<std::string> out; if (n == 0) { return out; } if (n < 0 || sep.empty()) { if (sep.empty()) { for (char c : s) { out.push_back(std::string(1, c)); } if (n < 0) { return out; } } else { std::size_t start = 0; while (true) { std::size_t pos = s.find(sep, start); if (pos == std::string::npos) { out.push_back(s.substr(start)); break; } out.push_back(s.substr(start, pos - start)); start = pos + sep.size(); } return out; } } std::size_t start = 0; while (static_cast<int>(out.size()) < n - 1) { std::size_t pos = s.find(sep, start); if (pos == std::string::npos) { break; } out.push_back(s.substr(start, pos - start)); start = pos + sep.size(); } out.push_back(s.substr(start)); return out; }`},
+		{trigger: "strings.Split", code: `inline auto stringsSplit(std::string const& s, std::string const& sep) -> std::vector<std::string> { std::vector<std::string> out; if (sep.empty()) { for (char c : s) { out.push_back(std::string(1, c)); } return out; } std::size_t start = 0; while (true) { std::size_t pos = s.find(sep, start); if (pos == std::string::npos) { out.push_back(s.substr(start)); break; } out.push_back(s.substr(start, pos - start)); start = pos + sep.size(); } return out; }`},
+		{trigger: "strings.TrimSpace", code: `inline auto stringsTrimSpace(std::string const& s) -> std::string { std::string news {}; for (auto l : s) { if (l != ' ' && l != '\n' && l != '\t' && l != '\v' && l != '\f' && l != '\r') { news += l; } } return news; }`},
+		{trigger: "fmtSprint", code: `template <typename... Args>
+std::string fmtSprint(Args... args) {
+    std::string result;
+    bool prevWasString = false;
+    auto appendOne = [&](auto&& x) {
+        using U = std::decay_t<decltype(x)>;
+        bool isStr = std::is_same<U, const char*>::value || std::is_same<U, std::string>::value;
+        if (!result.empty() && !isStr && !prevWasString) { result += " "; }
+        result += fmtSprintf("%v", x);
+        prevWasString = isStr;
+    };
+    (appendOne(args), ...);
+    return result;
+}`},
+		{trigger: "fmtSprint", code: `template <typename T> auto _fmt_has_str(int) -> decltype(std::declval<T&>()._str(), std::true_type {});
+template <typename T> auto _fmt_has_str(long) -> std::false_type;
+
 template <typename T>
-std::string fmtSprintf(const std::string& fmt, T arg1, T arg2, T arg3)
-{
-    std::string tmp = fmt;
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg1), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg2), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg3), std::regex_constants::format_first_only);
-    return tmp;
+std::string _fmt_format_arg(char verb, T x) {
+    std::ostringstream ss;
+    ss << std::boolalpha;
+    if (verb == 'q') {
+        ss << '"';
+    }
+    if constexpr (decltype(_fmt_has_str<T>(0))::value) {
+        ss << x._str();
+    } else if (verb == 'x') {
+        if constexpr (std::is_integral<T>::value && !std::is_same<T, bool>::value) {
+            ss << std::hex << static_cast<long long>(x);
+        } else {
+            ss << x;
+        }
+    } else if constexpr (std::is_integral<T>::value && !std::is_same<T, bool>::value && (sizeof(T) < sizeof(int))) {
+        ss << static_cast<int>(x);
+    } else {
+        ss << x;
+    }
+    if (verb == 'q') {
+        ss << '"';
+    }
+    return ss.str();
 }
-template <typename T>
-std::string fmtSprintf(const std::string& fmt, T arg1, T arg2, T arg3, T arg4)
-{
-    std::string tmp = fmt;
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg1), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg2), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg3), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg4), std::regex_constants::format_first_only);
-    return tmp;
+
+template <typename... Args>
+std::string fmtSprintf(std::string const& fmt, Args... args) {
+    std::string result;
+    std::size_t pos = 0;
+    auto flushLiterals = [&](bool stopAtVerb) {
+        while (pos < fmt.size()) {
+            char c = fmt[pos];
+            if (c == '%') {
+                if (pos + 1 < fmt.size() && fmt[pos + 1] == '%') { result += '%'; pos += 2; continue; }
+                if (stopAtVerb && pos + 1 < fmt.size()) {
+                    char verb = fmt[pos + 1];
+                    if (verb == 'v' || verb == 's' || verb == 'd' || verb == 'f' || verb == 't' || verb == 'x' || verb == 'g' || verb == 'q') {
+                        return true;
+                    }
+                }
+                result += c;
+                pos += 1;
+                continue;
+            }
+            result += c;
+            pos += 1;
+        }
+        return false;
+    };
+    auto consumeArg = [&](auto&& x) {
+        if (flushLiterals(true)) {
+            char verb = fmt[pos + 1];
+            result += _fmt_format_arg(verb, x);
+            pos += 2;
+        }
+    };
+    (consumeArg(args), ...);
+    flushLiterals(false);
+    return result;
+}`},
+		{trigger: "_go2cpp_slice", code: `template <typename C>
+auto _go2cpp_slice(C const& c, std::size_t from, std::size_t to) -> C {
+    if (to > c.size()) { to = c.size(); }
+    if (from > to) { from = to; }
+    return C(c.begin() + from, c.begin() + to);
+}`},
+		{trigger: "_go2cpp_append", code: `template <typename C, typename... A>
+auto _go2cpp_append(C c, A... args) -> C {
+    (c.push_back(args), ...);
+    return c;
 }
-template <typename T>
-std::string fmtSprintf(const std::string& fmt, T arg1, T arg2, T arg3, T arg4, T arg5)
-{
-    std::string tmp = fmt;
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg1), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg2), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg3), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg4), std::regex_constants::format_first_only);
-    tmp = std::regex_replace(tmp, std::regex("%(s|v|d|f)"), std::to_string(arg5), std::regex_constants::format_first_only);
-    return tmp;
-}
-`,
-		"len": `
+template <typename C>
+auto _go2cpp_appendSpread(C c, C const& more) -> C {
+    for (auto const& x : more) { c.push_back(x); }
+    return c;
+}`},
+		{trigger: "_go2cpp_copy", code: `template <typename D, typename S>
+auto _go2cpp_copy(D& dst, S const& src) -> int {
+    auto n = std::min(dst.size(), src.size());
+    std::copy(src.begin(), src.begin() + n, dst.begin());
+    return static_cast<int>(n);
+}`},
+		{trigger: "cap(", code: `template <typename C>
+auto cap(C const& c) -> int { return static_cast<int>(c.capacity()); }`},
+		{trigger: "gochan", code: `template <typename T>
+class gochan {
+    std::deque<T> buf;
+    std::size_t cap_;
+    bool closed_ = false;
+    std::mutex m;
+    std::condition_variable cv;
+
+public:
+    explicit gochan(std::size_t capacity) : cap_(capacity < 1 ? 1 : capacity) {}
+    void send(T v) {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return buf.size() < cap_ || closed_; });
+        if (closed_) { return; }
+        buf.push_back(std::move(v));
+        cv.notify_all();
+    }
+    T recv() {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return !buf.empty() || closed_; });
+        if (buf.empty()) { return T{}; }
+        T v = std::move(buf.front());
+        buf.pop_front();
+        cv.notify_all();
+        return v;
+    }
+    std::pair<T, bool> recv2() {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return !buf.empty() || closed_; });
+        if (buf.empty()) { return std::pair<T, bool> { T {}, false }; }
+        T v = std::move(buf.front());
+        buf.pop_front();
+        cv.notify_all();
+        return std::pair<T, bool> { v, true };
+    }
+    void close() {
+        std::lock_guard<std::mutex> lk(m);
+        closed_ = true;
+        cv.notify_all();
+    }
+};`},
+		{trigger: "timeSleep", code: `inline auto timeSleep(int ms) -> void { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }`},
+		{trigger: "len", code: `
 template <typename T>
 inline auto len(T x) -> int { return x.size(); }
-`,
+`},
 	}
-	if useFormatOutput && !haveStructs {
-		replacements["_format_output"] = `template <typename T> void _format_output(std::ostream& out, T x)
-{
-    if constexpr (std::is_same<T, bool>::value) {
-        out << std::boolalpha << x << std::noboolalpha;
-    } else if constexpr (std::is_integral<T>::value) {
-        out << static_cast<int>(x);
-    } else {
-        out << x;
-    }
-}`
-	}
-	for k, v := range replacements {
-		if strings.Contains(output, k) {
-			output = strings.Replace(output, k, strings.Replace(k, ".", "", -1), -1)
-			output = v + "\n" + output
+	for _, shim := range shims {
+		code := shim.code
+		if shim.trigger == "_format_output" && useFormatOutput && !haveStructs {
+			code = simpleFormatOutput
+		}
+		if strings.Contains(output, shim.trigger) {
+			output = strings.Replace(output, shim.trigger, strings.Replace(shim.trigger, ".", "", -1), -1)
+			output = code + "\n" + output
 		}
 	}
 	return output
@@ -408,6 +676,9 @@ func FunctionSignature(source string) (output, returntype, name string) {
 	if strings.Contains(rets, ",") {
 		// Multiple return
 		rets = tupleType + "<" + CPPTypes(rets) + ">"
+	} else if strings.TrimSpace(rets) != "" {
+		// Single return type
+		rets = TypeReplace(rets)
 	}
 	name = leftBetween(output, "func ", "(")
 	if name == "main" {
@@ -481,6 +752,10 @@ func PrintStatement(source string) (string, bool) {
 	}
 
 	fname := strings.TrimSpace(source[:strings.Index(source, "(")])
+	// fmt.Sprint returns a string and is not a print statement
+	if fname == "fmt.Sprint" {
+		return source, false
+	}
 	//fmt.Println("FNAME", fname)
 
 	// Check if the function call ends with "ln" (println, fmt.Println)
@@ -513,16 +788,12 @@ func PrintStatement(source string) (string, bool) {
 
 	if strings.HasSuffix(fname, "rintf") {
 		output := source
-		// TODO: Also support fmt.Fprintf, and format %v values differently.
-		//       Converting to an iostream expression is one possibility.
-		output = strings.Replace(output, "fmt.Printf", "printf", 1)
+		// fmt.Printf prints the formatted string to stdout, fmt.Sprintf
+		// returns it. The variadic fmtSprintf shim formats the arguments.
+		// fmt.Fprintf with FILE handles falls back to C fprintf.
+		output = strings.Replace(output, "fmt.Printf", "std::cout << fmtSprintf", 1)
 		output = strings.Replace(output, "fmt.Fprintf", "fprintf", 1)
-		output = strings.Replace(output, "fmt.Sprintf", "sprintf", 1)
-		if strings.Contains(output, "%v") {
-			// TODO: Upgrade this in the future
-			output = strings.Replace(output, "%v", "%s", -1)
-			//panic("support for %v is not implemented yet")
-		}
+		output = strings.Replace(output, "fmt.Sprintf", "fmtSprintf", 1)
 		return output, mayNeedPrettyPrint
 	}
 
@@ -664,15 +935,58 @@ func DeferCall(source string) string {
 	}
 }
 
+// convertInitStatement rewrites a Go if/switch init part `x := expr` to
+// the C++17 init statement `auto x = expr`. Multiple variables become a
+// structured binding: a, b := f() -> auto [a, b] = f().
+func convertInitStatement(initPart string) string {
+	initPart = strings.TrimSpace(initPart)
+	idx := strings.Index(initPart, ":=")
+	if idx < 0 {
+		return initPart
+	}
+	names := strings.TrimSpace(initPart[:idx])
+	rest := strings.TrimSpace(initPart[idx+2:])
+	if names == "" || strings.ContainsAny(names, "([{") {
+		return initPart
+	}
+	if strings.Contains(names, ",") {
+		var clean []string
+		for _, n := range strings.Split(names, ",") {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				return initPart
+			}
+			clean = append(clean, n)
+		}
+		return "auto [" + strings.Join(clean, ", ") + "] = " + rest
+	}
+	return "auto " + names + " = " + rest
+}
+
+// IfSentence transforms an if statement line. The C++17 init statement
+// syntax makes Go if-init statements transpile directly:
+// if v := f(); v > 2 { -> if (auto v = f(); v > 2) {
 func IfSentence(source string) (output string) {
 	output = source
 	expression := strings.TrimSpace(leftBetweenRightmost(source, "if", "{"))
+	if idx := strings.Index(expression, ";"); idx >= 0 {
+		initPart := strings.TrimSpace(expression[:idx])
+		if strings.Contains(initPart, ":=") {
+			expression = convertInitStatement(initPart) + "; " + strings.TrimSpace(expression[idx+1:])
+		}
+	}
 	return "if (" + expression + ") {"
 }
 
 func ElseIfSentence(source string) (output string) {
 	output = source
 	expression := strings.TrimSpace(leftBetweenRightmost(source, "} else if", "{"))
+	if idx := strings.Index(expression, ";"); idx >= 0 {
+		initPart := strings.TrimSpace(expression[:idx])
+		if strings.Contains(initPart, ":=") {
+			expression = convertInitStatement(initPart) + "; " + strings.TrimSpace(expression[idx+1:])
+		}
+	}
 	return "} else if (" + expression + ") {"
 }
 
@@ -713,6 +1027,13 @@ func TypeReplace(source string) string {
 	case "uint":
 		return "unsigned int"
 	default:
+		if _, isIface := scanInterfaces[trimmed]; isIface {
+			// Interface types are used through pointers
+			return trimmed + "*"
+		}
+		if strings.HasPrefix(trimmed, "chan ") {
+			return "gochan<" + TypeReplace(trimmed[5:]) + ">"
+		}
 		if strings.HasPrefix(trimmed, "[]") {
 			innerType := trimmed[2:]
 			return "std::vector<" + TypeReplace(innerType) + ">"
@@ -824,9 +1145,22 @@ func Switch(source string) (output string) {
 	if strings.HasSuffix(output, "{") {
 		output = strings.TrimSpace(output[:len(output)-1])
 	}
+	// Switch with init statement: switch n := f(); n {
+	initPart := ""
+	if idx := strings.Index(output, ";"); idx >= 0 {
+		initCandidate := strings.TrimSpace(output[:idx])
+		if strings.Contains(initCandidate, ":=") {
+			initPart = convertInitStatement(initCandidate)
+			output = strings.TrimSpace(output[idx+1:])
+		}
+	}
 	switchExpressionCounter++
 	firstCase = true
-	return "auto&& " + SwitchExpressionVariable() + " = " + output + "; // switch on " + output
+	result := ""
+	if initPart != "" {
+		result = initPart + ";\n"
+	}
+	return result + "auto&& " + SwitchExpressionVariable() + " = " + output + "; // switch on " + output
 }
 
 func Case(source string) (output string) {
@@ -860,7 +1194,14 @@ func VarDeclarations(source string) (string, []string) {
 			fields = fields[1:]
 		}
 		if len(fields) == 2 {
-			return TypeReplace(fields[1]) + " " + fields[0] + " = " + right, []string{fields[0]}
+			declared := TypeReplace(fields[1]) + " " + fields[0] + " = "
+			if _, isIface := scanInterfaces[fields[1]]; isIface {
+				// Interface values are pointers to heap allocations
+				if ctor := newIfImplementingLiteral(right); ctor != "" {
+					return declared + ctor, []string{fields[0]}
+				}
+			}
+			return declared + right, []string{fields[0]}
 		} else if len(fields) > 2 {
 			if strings.Contains(source, ",") {
 				leftFields := strings.Fields(left)
@@ -949,6 +1290,9 @@ func VarDeclarations(source string) (string, []string) {
 		fields = fields[1:]
 	}
 	if len(fields) == 2 {
+		if _, isIface := scanInterfaces[fields[1]]; isIface {
+			return TypeReplace(fields[1]) + " " + fields[0] + " = nullptr", []string{fields[0]}
+		}
 		return TypeReplace(fields[1]) + " " + fields[0], []string{fields[0]}
 	}
 	if strings.Contains(source, ",") {
@@ -1008,24 +1352,43 @@ func TypeDeclaration(source string) (string, bool) {
 	panic("Unrecognized type declaration: " + source)
 }
 
-func ConstDeclaration(source string) (output string) {
+// ConstDeclaration transforms a const declaration line from Go to C++.
+// inBlock is true when the line is part of a "const (" block, where each
+// line has an implicit iota index (starting at 0 for the first line of the
+// block) and the expression of the previous line is repeated implicitly
+// when no value is given.
+func ConstDeclaration(source string, inBlock bool) (output string) {
+	if inBlock {
+		// Each const line in the block increments iota by one
+		if iotaFirstLine {
+			iotaFirstLine = false
+		} else {
+			iotaNumber++
+		}
+	}
 	output = source
 	fields := strings.SplitN(source, "=", 2)
-	if len(fields) == 0 {
-		panic("no fields in const declaration")
-	} else if len(fields) == 1 {
-		// This happens if there is only a constant name, with no value assigned
-		// Only simple iota incrementation is supported so far (not .. << ..)
-		iotaNumber++
-		return "const auto " + strings.TrimSpace(fields[0]) + " = " + strconv.Itoa(iotaNumber)
+	if len(fields) == 1 {
+		// Only a constant name, with no value assigned
+		name := strings.TrimSpace(fields[0])
+		if inBlock && lastConstExpr != "" {
+			return "const auto " + name + " = " + iotaSubstitute(lastConstExpr)
+		}
+		return "const auto " + name + " = " + strconv.Itoa(iotaNumber)
 	}
 	left := strings.TrimSpace(fields[0])
 	right := strings.TrimSpace(fields[1])
-	words := strings.Split(left, " ")
-	if right == "iota" {
-		iotaNumber = 0
-		right = strconv.Itoa(iotaNumber)
+	if inBlock {
+		lastConstExpr = right
 	}
+	if strings.Contains(right, "iota") {
+		if !inBlock {
+			// A standalone const line has iota set to 0
+			iotaNumber = 0
+		}
+		right = iotaSubstitute(right)
+	}
+	words := strings.Split(left, " ")
 	if len(words) == 1 {
 		// No type
 		return "const auto " + left + " = " + right
@@ -1037,6 +1400,12 @@ func ConstDeclaration(source string) (output string) {
 	}
 	// Unrecognized
 	panic("go2cpp: unrecognized const expression: " + source)
+}
+
+// iotaSubstitute replaces the word "iota" in the given expression with the
+// current iota number.
+func iotaSubstitute(expression string) string {
+	return iotaWord.ReplaceAllString(expression, strconv.Itoa(iotaNumber))
 }
 
 // HashElements transforms the contents of a map in Go to the contents of an unordered_map in C++
@@ -1098,7 +1467,331 @@ func CreateStrMethod(varNames []string) string {
 	return sb.String()
 }
 
-func go2cpp(source string) string {
+// --- Interface support ---
+// The pre-scan collects interface declarations and struct methods before the
+// line transformation, and computes which structs implement which interfaces
+// (by method-name set).
+
+type cppMethodSig struct {
+	name   string
+	params string // Go syntax parameters as written
+	ret    string // Go syntax return type, empty for none
+}
+
+var (
+	scanInterfaces    = map[string][]cppMethodSig{}  // interface name -> methods
+	structMethodNames = map[string]map[string]bool{} // struct type -> method names
+	implementedIface  = map[string][]string{}        // struct type -> interface names
+	structFieldsCpp   = map[string][]cppField{}      // struct type -> fields in declaration order
+)
+
+type cppField struct {
+	name    string
+	cpptype string
+}
+
+// implementingStructNames returns the sorted names of all structs that
+// implement at least one interface.
+func implementingStructNames() []string {
+	var names []string
+	for name := range implementedIface {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// zeroValueFor returns a C++ zero value expression for the given type.
+func zeroValueFor(cppType string) string {
+	if strings.HasSuffix(cppType, "*") {
+		return "nullptr"
+	}
+	if cppType == "std::string" {
+		return "std::string()"
+	}
+	if cppType == "bool" {
+		return "false"
+	}
+	return "0"
+}
+
+// isIdentByte reports whether the byte can be part of an identifier.
+func isIdentByte(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+var structNamedFieldRe = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*:`)
+
+// buildConstructorArgs converts the contents of a struct literal to a C++
+// constructor argument list, using the field declaration order.
+func buildConstructorArgs(structName, inner string) string {
+	fields := structFieldsCpp[structName]
+	if len(fields) == 0 {
+		return ""
+	}
+	inner = strings.TrimSpace(inner)
+	if inner == "" {
+		var args []string
+		for _, f := range fields {
+			args = append(args, zeroValueFor(f.cpptype))
+		}
+		return strings.Join(args, ", ")
+	}
+	parts := SplitArgs(inner)
+	named := true
+	values := map[string]string{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		m := structNamedFieldRe.FindStringSubmatch(part)
+		if m == nil {
+			named = false
+			break
+		}
+		values[m[1]] = strings.TrimSpace(part[len(m[0]):])
+	}
+	var args []string
+	if named {
+		for _, f := range fields {
+			if v, ok := values[f.name]; ok {
+				args = append(args, v)
+			} else {
+				args = append(args, zeroValueFor(f.cpptype))
+			}
+		}
+	} else {
+		for i, part := range parts {
+			if i >= len(fields) {
+				break
+			}
+			args = append(args, strings.TrimSpace(part))
+		}
+	}
+	return strings.Join(args, ", ")
+}
+
+// rewriteStructLiterals rewrites struct literals of interface-implementing
+// structs (which are non-aggregates due to inheritance) to constructor
+// calls: Rect{W: 2, H: 3} -> Rect(2, 3).
+func rewriteStructLiterals(line string) string {
+	for _, t := range implementingStructNames() {
+		needle := t + "{"
+		for {
+			idx := -1
+			for start := 0; start+len(needle) <= len(line); start++ {
+				if line[start:start+len(needle)] == needle && (start == 0 || !isIdentByte(line[start-1])) {
+					idx = start
+					break
+				}
+			}
+			if idx < 0 {
+				break
+			}
+			open := idx + len(needle) - 1
+			depth := 0
+			end := -1
+			for j := open; j < len(line); j++ {
+				if line[j] == '{' {
+					depth++
+				} else if line[j] == '}' {
+					depth--
+					if depth == 0 {
+						end = j
+						break
+					}
+				}
+			}
+			if end < 0 {
+				break
+			}
+			inner := line[open+1 : end]
+			args := buildConstructorArgs(t, inner)
+			line = line[:idx] + t + "(" + args + ")" + line[end+1:]
+		}
+	}
+	return line
+}
+
+// newIfImplementingLiteral returns "new T(args)" when the right-hand side is
+// a struct literal of an interface-implementing struct, otherwise "".
+func newIfImplementingLiteral(right string) string {
+	for _, t := range implementingStructNames() {
+		if strings.HasPrefix(right, t+"{") {
+			return "new " + t + "(" + buildConstructorArgs(t, leftBetween(right, "{", "}")) + ")"
+		}
+	}
+	return ""
+}
+
+// constructorFor generates a constructor for an interface-implementing
+// struct, since inheritance makes it a non-aggregate.
+func constructorFor(structName string) string {
+	fields := structFieldsCpp[structName]
+	if len(fields) == 0 {
+		return ""
+	}
+	var params, inits []string
+	for _, f := range fields {
+		params = append(params, f.cpptype+" "+f.name)
+		inits = append(inits, f.name+"("+f.name+")")
+	}
+	return structName + "(" + strings.Join(params, ", ") + ") : " + strings.Join(inits, ", ") + " {}"
+}
+
+// scanTypeDecls scans the source for interface declarations and methods.
+func scanTypeDecls(source string, cppLines map[int]bool) {
+	scanInterfaces = map[string][]cppMethodSig{}
+	structMethodNames = map[string]map[string]bool{}
+	implementedIface = map[string][]string{}
+	structFieldsCpp = map[string][]cppField{}
+
+	lines := strings.Split(source, "\n")
+	currentIface := ""
+	var currentIfaceMethods []cppMethodSig
+	currentStruct := ""
+	for i, line := range lines {
+		if cppLines[i] {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if currentStruct != "" {
+			// Collect the fields of a struct, in declaration order
+			if trimmed == "}" {
+				currentStruct = ""
+				continue
+			}
+			if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			idx := strings.IndexAny(trimmed, " \t")
+			if idx < 0 {
+				continue
+			}
+			namePart := trimmed[:idx]
+			typePart := strings.TrimSpace(trimmed[idx+1:])
+			if bt := strings.Index(typePart, "`"); bt >= 0 {
+				// Strip struct field tags: Name string `json:"name"`
+				typePart = strings.TrimSpace(typePart[:bt])
+			}
+			cppType := TypeReplace(typePart)
+			for _, n := range strings.Split(namePart, ",") {
+				n = strings.TrimSpace(n)
+				if n != "" {
+					structFieldsCpp[currentStruct] = append(structFieldsCpp[currentStruct], cppField{n, cppType})
+				}
+			}
+			continue
+		}
+		if currentIface == "" {
+			if strings.HasPrefix(trimmed, "type ") && strings.Contains(trimmed, " struct {") {
+				currentStruct = typeName(trimmed)
+			} else if strings.HasPrefix(trimmed, "type ") && strings.Contains(trimmed, " interface {") {
+				currentIface = typeName(trimmed)
+			}
+			continue
+		}
+		if trimmed == "}" {
+			if currentIface != "" && len(currentIfaceMethods) > 0 {
+				scanInterfaces[currentIface] = currentIfaceMethods
+			}
+			currentIface = ""
+			currentIfaceMethods = nil
+			continue
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || !strings.Contains(trimmed, "(") {
+			continue
+		}
+		name := strings.TrimSpace(leftBetween(trimmed, "", "("))
+		params := leftBetween(trimmed, "(", ")")
+		ret := ""
+		if idx := strings.LastIndex(trimmed, ")"); idx >= 0 {
+			ret = strings.TrimSpace(trimmed[idx+1:])
+		}
+		if name != "" {
+			currentIfaceMethods = append(currentIfaceMethods, cppMethodSig{name, params, ret})
+		}
+	}
+	for i, line := range lines {
+		if cppLines[i] {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "func (") {
+			continue
+		}
+		_, recvType, methodName, _, _, _ := parseMethodDecl(trimmed)
+		if recvType == "" || methodName == "" {
+			continue
+		}
+		recvType = strings.TrimPrefix(recvType, "*")
+		if structMethodNames[recvType] == nil {
+			structMethodNames[recvType] = map[string]bool{}
+		}
+		structMethodNames[recvType][methodName] = true
+	}
+	for iface, methods := range scanInterfaces {
+		for structName, methodSet := range structMethodNames {
+			allPresent := true
+			for _, m := range methods {
+				if !methodSet[m.name] {
+					allPresent = false
+					break
+				}
+			}
+			if allPresent && len(methods) > 0 {
+				implementedIface[structName] = append(implementedIface[structName], iface)
+			}
+		}
+	}
+}
+
+// typeName extracts the type name from `type X interface {` / `type X struct {`.
+func typeName(trimmed string) string {
+	fields := strings.Split(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(trimmed), "{")), " ")
+	if len(fields) >= 2 {
+		return fields[1]
+	}
+	return ""
+}
+
+// parseMethodDecl parses `func (r Rect) Area(a int) int {`.
+func parseMethodDecl(trimmed string) (recvName, recvType, methodName, params, ret string, isPtr bool) {
+	inner := leftBetween(trimmed, "(", ")")
+	restIdx := strings.Index(trimmed, ")")
+	rest := ""
+	if restIdx >= 0 {
+		rest = strings.TrimSpace(trimmed[restIdx+1:])
+	}
+	innerWords := strings.Split(strings.TrimSpace(inner), " ")
+	if len(innerWords) >= 2 {
+		recvName = strings.TrimSpace(innerWords[0])
+		recvType = strings.TrimSpace(innerWords[len(innerWords)-1])
+		if strings.HasPrefix(recvType, "*") {
+			isPtr = true
+			recvType = strings.TrimPrefix(recvType, "*")
+		}
+	}
+	if pidx := strings.Index(rest, "("); pidx >= 0 {
+		methodName = strings.TrimSpace(rest[:pidx])
+		params = leftBetween(rest, "(", ")")
+		if lastIdx := strings.LastIndex(rest, ")"); lastIdx >= 0 {
+			ret = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(rest[lastIdx+1:]), "{"))
+		}
+	}
+	return
+}
+
+// wrapIfStructLiteral wraps a struct literal in new when its type implements
+// an interface, so that it can be assigned to an interface pointer.
+func wrapIfStructLiteral(right string) string {
+	for structName := range implementedIface {
+		if strings.HasPrefix(right, structName+"{") {
+			return "new " + right
+		}
+	}
+	return right
+}
+
+func go2cppLines(source string) lineTransformResult {
 	functionVarMap := map[string]string{} // variable names encountered in the function so far, and their corresponding smart names
 	inMultilineString := false
 	debugOutput := false
@@ -1110,6 +1803,11 @@ func go2cpp(source string) string {
 	inType := false
 	inConst := false
 	inHashMap := false
+	inGoFunction := false
+	inInterface := false
+	currentStructName := ""
+	glueLines := []string{}
+	var interfaceVars []string
 	hashKeyType := ""
 	curlyCount := 0
 	// Keep track of encountered hash maps
@@ -1120,7 +1818,22 @@ func go2cpp(source string) string {
 	inStruct := false
 	usePrettyPrint := false
 	closingBracketNeedsASemicolon := false
-	for _, line := range strings.Split(source, "\n") {
+	cppCode, cppLines, cppFuncNames := extractCppBlocks(source)
+	scanTypeDecls(source, cppLines)
+	ifaceMethodNames := []string{}
+	for _, ms := range scanInterfaces {
+		for _, m := range ms {
+			if !has(ifaceMethodNames, m.name) {
+				ifaceMethodNames = append(ifaceMethodNames, m.name)
+			}
+		}
+	}
+	skipUntilDepth := -1
+	for i, line := range strings.Split(source, "\n") {
+		if cppLines[i] {
+			// Part of a const cpp raw string constant, emitted verbatim later
+			continue
+		}
 
 		if debugOutput {
 			fmt.Fprintf(os.Stderr, "%s\n", line)
@@ -1144,6 +1857,14 @@ func go2cpp(source string) string {
 		}
 		// Keep track of how deep we are into curly brackets
 		curlyCount += (strings.Count(trimmedLine, "{") - strings.Count(trimmedLine, "}"))
+		if skipUntilDepth >= 0 {
+			// Inside a Go function that is replaced by a C++ definition from
+			// a const cpp block. Skip lines until the function is closed.
+			if curlyCount < skipUntilDepth {
+				skipUntilDepth = -1
+			}
+			continue
+		}
 		if inImport && strings.Contains(trimmedLine, ")") {
 			inImport = false
 			continue
@@ -1162,6 +1883,14 @@ func go2cpp(source string) string {
 			inHashMap = false
 			newLine = trimmedLine + ";"
 		} else if inVar || (inStruct && trimmedLine != "}") {
+			if inStruct {
+				// Strip struct field tags: Name string `json:"name"`
+				if bt := strings.Index(trimmedLine, "`"); bt >= 0 {
+					if bt2 := strings.Index(trimmedLine[bt+1:], "`"); bt2 >= 0 {
+						trimmedLine = strings.TrimSpace(trimmedLine[:bt] + trimmedLine[bt+bt2+2:])
+					}
+				}
+			}
 			var varNames []string
 			newLine, varNames = VarDeclarations(trimmedLine)
 			if strings.HasSuffix(newLine, "{") {
@@ -1180,11 +1909,103 @@ func go2cpp(source string) string {
 				encounteredStructNames = []string{}
 			}
 		} else if inConst {
-			newLine = ConstDeclaration(line)
+			newLine = ConstDeclaration(line, true)
 		} else if inHashMap && !inMultilineString {
 			newLine = HashElements(trimmedLine, hashKeyType, false)
-		} else if strings.HasPrefix(trimmedLine, "func") {
+		} else if inInterface && trimmedLine == "}" {
+			newLine = "};"
+			inInterface = false
+		} else if inInterface {
+			// Interface method: Area() float64 -> virtual double Area() = 0;
+			name := strings.TrimSpace(leftBetween(trimmedLine, "", "("))
+			params := leftBetween(trimmedLine, "(", ")")
+			ret := ""
+			if idx := strings.LastIndex(trimmedLine, ")"); idx >= 0 {
+				ret = strings.TrimSpace(trimmedLine[idx+1:])
+			}
+			retCpp := "void"
+			if ret != "" {
+				retCpp = TypeReplace(ret)
+			}
+			newLine = "virtual " + retCpp + " " + name + "(" + FunctionArguments(params) + ") = 0;"
+		} else if strings.HasPrefix(trimmedLine, "func (") {
+			// Method declaration: func (r Rect) Area() float64 {
+			recvName, recvType, methodName, goParams, goRet, isPtr := parseMethodDecl(trimmedLine)
+			freeName := recvType + "_" + methodName
+			recvGo := recvName + " " + recvType
+			if isPtr {
+				recvGo = recvName + " *" + recvType
+			}
+			allParams := recvGo
+			if goParams != "" {
+				allParams = recvGo + ", " + goParams
+			}
+			retCpp := "void"
+			if goRet != "" {
+				retCpp = TypeReplace(goRet)
+			}
+			newLine = "auto " + freeName + "(" + FunctionArguments(allParams) + ") -> " + retCpp + " {"
+			// Out-of-line member definition, appended after the transpiled body
+			forwardArgs := "*this"
+			if isPtr {
+				forwardArgs = "this"
+			}
+			forwardOK := true
+			memberParams := ""
+			if goParams != "" {
+				var paramNames []string
+				for _, part := range strings.Split(goParams, ",") {
+					words := strings.Fields(strings.TrimSpace(part))
+					if len(words) < 2 {
+						forwardOK = false
+						break
+					}
+					paramNames = append(paramNames, words[len(words)-1])
+				}
+				if forwardOK {
+					memberParams = FunctionArguments(goParams)
+					for _, pn := range paramNames {
+						forwardArgs += ", " + pn
+					}
+				}
+			}
+			if forwardOK {
+				glueLines = append(glueLines, "inline "+retCpp+" "+recvType+"::"+methodName+"("+memberParams+") { return "+freeName+"("+forwardArgs+"); }")
+			}
 			functionVarMap = map[string]string{}
+			interfaceVars = nil
+			if goParams != "" {
+				for _, part := range strings.Split(goParams, ",") {
+					words := strings.Fields(strings.TrimSpace(part))
+					if len(words) >= 2 {
+						if _, isIface := scanInterfaces[words[len(words)-1]]; isIface {
+							interfaceVars = append(interfaceVars, words[0])
+						}
+					}
+				}
+			}
+		} else if strings.HasPrefix(trimmedLine, "func") {
+			if name := functionDeclName(trimmedLine); name != "" && has(cppFuncNames, name) {
+				// This function is replaced by a C++ definition from a
+				// const cpp block. Skip it entirely.
+				if strings.Count(trimmedLine, "{") == strings.Count(trimmedLine, "}") {
+					continue
+				}
+				skipUntilDepth = curlyCount
+				continue
+			}
+			functionVarMap = map[string]string{}
+			interfaceVars = nil
+			if goArgs := leftBetween(trimmedLine, "(", ")"); goArgs != "" {
+				for _, part := range strings.Split(goArgs, ",") {
+					words := strings.Fields(strings.TrimSpace(part))
+					if len(words) >= 2 {
+						if _, isIface := scanInterfaces[words[len(words)-1]]; isIface {
+							interfaceVars = append(interfaceVars, words[0])
+						}
+					}
+				}
+			}
 			newLine, currentReturnType, currentFunctionName = FunctionSignature(trimmedLine)
 		} else if strings.HasPrefix(trimmedLine, "for") {
 			newLine = ForLoop(line, encounteredHashMaps)
@@ -1199,6 +2020,11 @@ func go2cpp(source string) string {
 				//} else {
 				// Just use the standard tuple
 			}
+			if strings.HasSuffix(strings.TrimSpace(newLine), "}") {
+				// Struct literal returns end with a brace, which would otherwise
+				// suppress the trailing semicolon
+				newLine = strings.TrimSpace(newLine) + ";"
+			}
 		} else if strings.HasPrefix(trimmedLine, "fmt.Print") || strings.HasPrefix(trimmedLine, "print") {
 			// _ is if "pretty print" functionality may be needed, for non-literal strings and numbers
 			var pp bool
@@ -1206,7 +2032,7 @@ func go2cpp(source string) string {
 			if pp {
 				usePrettyPrint = true
 			}
-		} else if strings.Contains(trimmedLine, "=") && !strings.HasPrefix(trimmedLine, "var ") && !strings.HasPrefix(trimmedLine, "if ") && !strings.HasPrefix(trimmedLine, "const ") && !strings.HasPrefix(trimmedLine, "type ") {
+		} else if strings.Contains(trimmedLine, "=") && !strings.HasPrefix(trimmedLine, "var ") && !strings.HasPrefix(trimmedLine, "if ") && !strings.HasPrefix(trimmedLine, "const ") && !strings.HasPrefix(trimmedLine, "type ") && !strings.HasPrefix(trimmedLine, "} else if ") {
 			elem := strings.SplitN(trimmedLine, "=", 2)
 			left := strings.TrimSpace(elem[0])
 			declarationAssignment := false
@@ -1215,8 +2041,22 @@ func go2cpp(source string) string {
 				left = left[:len(left)-1]
 			}
 			right := strings.TrimSpace(elem[1])
+			if strings.HasPrefix(right, "<-") {
+				// Channel receive: v := <-ch or v, ok := <-ch
+				chanName := strings.TrimSpace(strings.TrimPrefix(right, "<-"))
+				if strings.Contains(left, ",") {
+					right = chanName + ".recv2()"
+				} else {
+					right = chanName + ".recv()"
+				}
+			}
 			if strings.HasPrefix(right, "&") && strings.Contains(right, "{") && strings.Contains(right, "}") {
 				right = "new " + right[1:]
+			}
+			if strings.HasPrefix(right, "\"") && strings.HasSuffix(right, "\"") && !strings.Contains(right, "\" + \"") {
+				// A string literal on the right side becomes a std::string,
+				// so that methods like size() and slicing work on it.
+				right = "std::string(" + right + ")"
 			}
 			if strings.Contains(left, ",") {
 				if strings.Contains(left, "_") {
@@ -1253,7 +2093,40 @@ func go2cpp(source string) string {
 					newLine = "auto [" + left + "] = " + right
 				}
 			} else if declarationAssignment {
-				if strings.HasPrefix(right, "[]") {
+				if strings.HasPrefix(right, "make(chan") {
+					// ch := make(chan T) or ch := make(chan T, n)
+					hashName := strings.TrimSpace(left)
+					inner := strings.TrimSpace(after("make(", right))
+					inner = strings.TrimSpace(strings.TrimSuffix(inner, ")"))
+					inner = strings.TrimSpace(strings.TrimPrefix(inner, "chan"))
+					capacity := "0"
+					elemType := inner
+					if strings.Contains(inner, ",") {
+						typeAndCap := strings.SplitN(inner, ",", 2)
+						elemType = strings.TrimSpace(typeAndCap[0])
+						capacity = strings.TrimSpace(typeAndCap[1])
+					}
+					newLine = "auto " + hashName + " = gochan<" + TypeReplace(elemType) + ">(" + capacity + ")"
+				} else if strings.HasPrefix(right, "make(map") {
+					// m := make(map[K]V)
+					hashName := strings.TrimSpace(left)
+					inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(after("make(", right)), ")"))
+					inner = strings.TrimSpace(strings.TrimPrefix(inner, "map"))
+					keyType := ""
+					valueType := ""
+					if strings.HasPrefix(inner, "[") {
+						if idx := strings.Index(inner, "]"); idx >= 0 {
+							keyType = TypeReplace(strings.TrimSpace(inner[1:idx]))
+							valueType = TypeReplace(strings.TrimSpace(inner[idx+1:]))
+						}
+					}
+					encounteredHashMaps = append(encounteredHashMaps, hashName)
+					newLine = "auto " + hashName + " = std::unordered_map<" + keyType + ", " + valueType + ">()"
+				} else if strings.HasPrefix(right, "new(") {
+					// x := new(T) -> zero-initialized allocation
+					inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(after("new(", right)), ")"))
+					newLine = "auto " + strings.TrimSpace(left) + " = new " + TypeReplace(inner) + "()"
+				} else if strings.HasPrefix(right, "[]") {
 					if !strings.Contains(right, "{") {
 						fmt.Fprintln(os.Stderr, "UNRECOGNIZED LINE: "+trimmedLine)
 						//newLine = line
@@ -1261,7 +2134,7 @@ func go2cpp(source string) string {
 					}
 					theType := TypeReplace(leftBetween(right, "]", "{"))
 					fields := strings.SplitN(right, "{", 2)
-					newLine = theType + " " + strings.TrimSpace(left) + "[] {" + fields[1]
+					newLine = "std::vector<" + theType + "> " + strings.TrimSpace(left) + " {" + fields[1]
 				} else if strings.HasPrefix(right, "map[") {
 					hashName := strings.TrimSpace(left)
 					encounteredHashMaps = append(encounteredHashMaps, hashName)
@@ -1290,8 +2163,37 @@ func go2cpp(source string) string {
 
 					newLine = "auto " + varName + " = " + strings.TrimSpace(right)
 				}
+			} else if has(interfaceVars, left) {
+				// Assignment to an interface-typed variable
+				if right == "nil" {
+					newLine = left + " = nullptr"
+				} else if ctor := newIfImplementingLiteral(right); ctor != "" {
+					newLine = left + " = " + ctor
+				} else {
+					newLine = left + " = " + right
+				}
 			} else {
 				newLine = left + " = " + right
+				// Compound assignment: total += x -> total = total + x
+				leftTrimmed := strings.TrimSpace(left)
+				var op string
+				switch {
+				case strings.HasSuffix(leftTrimmed, "<<"):
+					op = "<<"
+				case strings.HasSuffix(leftTrimmed, ">>"):
+					op = ">>"
+				case strings.HasSuffix(leftTrimmed, "+"), strings.HasSuffix(leftTrimmed, "-"),
+					strings.HasSuffix(leftTrimmed, "*"), strings.HasSuffix(leftTrimmed, "/"),
+					strings.HasSuffix(leftTrimmed, "%"), strings.HasSuffix(leftTrimmed, "&"),
+					strings.HasSuffix(leftTrimmed, "|"), strings.HasSuffix(leftTrimmed, "^"):
+					op = lastchar(leftTrimmed)
+				}
+				if op != "" {
+					lhs := strings.TrimSpace(strings.TrimSuffix(leftTrimmed, op))
+					if lhs != "" {
+						newLine = lhs + " = " + lhs + " " + op + " " + right
+					}
+				}
 			}
 		} else if strings.HasPrefix(trimmedLine, "package ") {
 			continue
@@ -1305,6 +2207,38 @@ func go2cpp(source string) string {
 			continue
 		} else if strings.HasPrefix(trimmedLine, "defer ") {
 			newLine = DeferCall(line)
+		} else if strings.HasPrefix(trimmedLine, "go ") {
+			// Goroutine start: go f(), go func() { ... }() spanning multiple lines.
+			// One-line anonymous goroutines are not supported.
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmedLine, "go "))
+			if rest == "func() {" {
+				// Anonymous goroutine spanning multiple lines
+				inGoFunction = true
+				newLine = "std::thread([]() {"
+			} else if strings.HasSuffix(rest, ")") && strings.Contains(rest, "(") {
+				// Plain function call in a goroutine
+				pidx := strings.Index(rest, "(")
+				fname := strings.TrimSpace(rest[:pidx])
+				args := strings.TrimSpace(rest[pidx+1 : len(rest)-1])
+				if args != "" {
+					newLine = "std::thread(" + fname + ", " + args + ").detach();"
+				} else {
+					newLine = "std::thread(" + fname + ").detach();"
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, "UNRECOGNIZED go STATEMENT: "+trimmedLine)
+				newLine = line
+			}
+		} else if strings.Contains(trimmedLine, " <- ") && !strings.HasPrefix(trimmedLine, "<-") {
+			// Channel send: ch <- v
+			parts := strings.SplitN(trimmedLine, " <- ", 2)
+			newLine = strings.TrimSpace(parts[0]) + ".send(" + strings.TrimSpace(parts[1]) + ")"
+		} else if strings.HasPrefix(trimmedLine, "close(") && strings.HasSuffix(trimmedLine, ")") {
+			// Channel close: close(ch)
+			newLine = strings.TrimSpace(leftBetween(trimmedLine, "close(", ")")) + ".close()"
+		} else if strings.HasPrefix(trimmedLine, "panic(") && strings.HasSuffix(trimmedLine, ")") {
+			// panic(msg) -> throw
+			newLine = "throw std::runtime_error(" + strings.TrimSpace(leftBetween(trimmedLine, "panic(", ")")) + ")"
 		} else if strings.HasPrefix(trimmedLine, "if ") {
 			newLine = IfSentence(line)
 			// TODO: Short variable names has the potential to ruin if expressions this way, do a smarter replacement
@@ -1322,17 +2256,46 @@ func go2cpp(source string) string {
 			continue
 		} else if trimmedLine == "const (" {
 			inConst = true
+			iotaNumber = 0
+			iotaFirstLine = true
+			lastConstExpr = ""
 			continue
 		} else if strings.HasPrefix(trimmedLine, "var ") {
 			// Ignore variable name since it's not in a struct
-			newLine, _ = VarDeclarations(line)
+			var varNames []string
+			newLine, varNames = VarDeclarations(line)
+			_ = varNames
+			fields := strings.Fields(trimmedLine)
+			if len(fields) >= 3 {
+				if _, isIface := scanInterfaces[fields[2]]; isIface {
+					interfaceVars = append(interfaceVars, strings.TrimSuffix(fields[1], ","))
+				}
+			}
 			if strings.HasSuffix(newLine, "{") {
 				closingBracketNeedsASemicolon = true
 			}
 		} else if strings.HasPrefix(trimmedLine, "type ") {
-			newLine, inStruct = TypeDeclaration(trimmedLine)
+			if strings.Contains(trimmedLine, " interface {") {
+				ifaceName := typeName(trimmedLine)
+				newLine = "class " + ifaceName + " {\npublic:\nvirtual ~" + ifaceName + "() = default;"
+				inInterface = true
+			} else {
+				newLine, inStruct = TypeDeclaration(trimmedLine)
+				if inStruct {
+					// Entering struct, reset the slice that is used to gather variable names
+					encounteredStructNames = []string{}
+					currentStructName = typeName(trimmedLine)
+					if len(implementedIface[currentStructName]) > 0 {
+						bases := ""
+						for _, iface := range implementedIface[currentStructName] {
+							bases += " : public " + iface
+						}
+						newLine = strings.Replace(newLine, " {", bases+" {", 1)
+					}
+				}
+			}
 		} else if strings.HasPrefix(trimmedLine, "const ") {
-			newLine = ConstDeclaration(trimmedLine)
+			newLine = ConstDeclaration(trimmedLine, false)
 		} else if trimmedLine == "fallthrough" {
 			newLine = "goto " + LabelName() + "; // fallthrough"
 			switchLabel = LabelName()
@@ -1340,6 +2303,9 @@ func go2cpp(source string) string {
 		} else if unfinishedDeferFunction && trimmedLine == "}()" {
 			unfinishedDeferFunction = false
 			newLine = "});"
+		} else if inGoFunction && trimmedLine == "}()" {
+			inGoFunction = false
+			newLine = "}).detach();"
 		} else if trimmedLine == "default:" {
 			newLine = "} else { // default case"
 			if switchLabel != "" {
@@ -1363,7 +2329,24 @@ func go2cpp(source string) string {
 			// If the struct is being closed, add a semicolon
 			if inStruct {
 				// Create a _str() method for this struct
-				newLine = CreateStrMethod(encounteredStructNames) + newLine + ";"
+				injected := ""
+				if len(implementedIface[currentStructName]) > 0 {
+					// Inheritance makes the struct a non-aggregate, so a
+					// constructor replaces the designated initializer syntax
+					if ctor := constructorFor(currentStructName); ctor != "" {
+						injected += ctor + "\n"
+					}
+				}
+				for _, iface := range implementedIface[currentStructName] {
+					for _, m := range scanInterfaces[iface] {
+						retCpp := "void"
+						if m.ret != "" {
+							retCpp = TypeReplace(m.ret)
+						}
+						injected += "virtual " + retCpp + " " + m.name + "(" + FunctionArguments(m.params) + ") override;\n"
+					}
+				}
+				newLine = injected + CreateStrMethod(encounteredStructNames) + newLine + ";"
 
 				inStruct = false
 			} else if closingBracketNeedsASemicolon {
@@ -1395,19 +2378,48 @@ func go2cpp(source string) string {
 			}
 		}
 
+		// Interface-implementing struct literals become constructor calls
+		newLine = rewriteStructLiterals(newLine)
+		// Interface variables call methods through pointers in C++
+		for _, iv := range interfaceVars {
+			for _, mn := range ifaceMethodNames {
+				newLine = strings.Replace(newLine, iv+"."+mn+"(", iv+"->"+mn+"(", -1)
+			}
+		}
+
 		lines = append(lines, newLine)
 	}
-	output := strings.Join(lines, "\n")
+	if len(glueLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, glueLines...)
+	}
+	return lineTransformResult{
+		output:         strings.Join(lines, "\n"),
+		usePrettyPrint: usePrettyPrint,
+		haveStructs:    len(encounteredStructNames) > 0,
+		cppBlock:       cppCode,
+	}
+}
 
-	// The order matters
+// finishCpp runs the whole-program passes on the combined transpiled output.
+// The order matters.
+func finishCpp(res lineTransformResult) string {
+	output := res.output
 	output = LiteralStrings(output)
 	output = WholeProgramReplace(output)
+	output = RewriteSlices(output)
 
 	// The order matters
-	output = AddFunctions(output, usePrettyPrint, len(encounteredStructNames) > 0)
+	output = AddFunctions(output, res.usePrettyPrint, res.haveStructs)
 	output = AddIncludes(output)
 
-	return output
+	return spliceCppBlock(output, res.cppBlock)
+}
+
+// go2cpp transforms Go source to C++ in one go, for a single file without
+// local package imports (used for debug output and deferred function bodies).
+func go2cpp(source string) string {
+	return finishCpp(go2cppLines(source))
 }
 
 func main() {
@@ -1458,21 +2470,26 @@ func main() {
 		return
 	}
 
+	transpiled, transpileErr := go2cppFile(inputFilename, string(sourceData))
+	if transpileErr != nil {
+		log.Fatal(transpileErr)
+	}
+
 	cppSource := ""
 	if clangFormat {
 		cmd := exec.Command("clang-format", "-style={BasedOnStyle: Webkit, ColumnLimit: 99}")
-		cmd.Stdin = strings.NewReader(go2cpp(string(sourceData)))
+		cmd.Stdin = strings.NewReader(transpiled)
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		err = cmd.Run()
 		if err != nil {
 			log.Println("clang-format is not available, the output will look ugly!")
-			cppSource = go2cpp(string(sourceData))
+			cppSource = transpiled
 		} else {
 			cppSource = out.String()
 		}
 	} else {
-		cppSource = go2cpp(string(sourceData))
+		cppSource = transpiled
 	}
 
 	if !compile {
@@ -1480,7 +2497,10 @@ func main() {
 		return
 	}
 
-	tempFile, err := ioutil.TempFile("", "go2cpp*")
+	// Use a temp file with the .exe suffix, so that MinGW clang++/g++ do not
+	// append .exe to the -o output name, which would make go2cpp read back
+	// an empty file on Windows. Harmless on other platforms.
+	tempFile, err := ioutil.TempFile("", "go2cpp*.exe")
 	if err != nil {
 		log.Fatal(err)
 	}

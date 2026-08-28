@@ -10,7 +10,8 @@ The intended use is not to convert entire existing Go programs to C++, but to he
 
 * Only works with simple code samples, for now.
 * Very few functions from the Go standard library are implemented. The ideal would be to be able to compile the official Go standard library.
-* A good plan for how to implement `import` is needed.
+
+Imports of local packages are supported: they are transpiled into the same single translation unit with qualifier-prefixed identifiers. Standard library imports are handled by trigger-based shims. See DIFFERENCES.md for the full comparison between Go and the code go2cpp generates.
 
 ## Features and limitations
 
@@ -23,7 +24,12 @@ The intended use is not to convert entire existing Go programs to C++, but to he
 ## Required dependencies
 
 * `g++` with support for C++20 is used for compiling the generated C++ code.
-* `clang-format` is used for formatting the generated C++ code.
+  The C++ compiler can be overridden with the `CXX` environment variable,
+  for example `CXX=clang++`. On Windows with MSYS2/MinGW toolchains, point
+  `CXX` to the full compiler path, for example
+  `C:\msys64\ucrt64\bin\clang++.exe`.
+* `clang-format` is used for formatting the generated C++ code (optional,
+  the unformatted code is used if it is not available).
 
 ## Installation
 
@@ -40,6 +46,31 @@ Compile to executable:
 Output what the intermediate C++20 code looks like:
 
     go2cpp main.go
+
+## Calling C++ functions
+
+A package-level raw string constant named `cpp` is emitted verbatim into
+the generated C++ program. Go functions whose names are declared in it are
+not transpiled — the C++ definitions are used instead, so the Go versions
+below only serve as fallbacks when running the program with `go run`:
+
+```go
+const cpp = `
+#include <cmath>
+auto cppSqrt(double x) -> double { return std::sqrt(x); }
+`
+
+func cppSqrt(x float64) float64 {
+	return math.Sqrt(x)
+}
+
+func main() {
+	println(cppSqrt(2))
+}
+```
+
+This works together with local package imports; each package file can have
+its own `const cpp` block. See DIFFERENCES.md for the exact rules.
 
 ## Example transformations
 
@@ -160,13 +191,13 @@ auto main() -> int
 ## Syntactic elements
 
 - [x] backtick quoted strings: <code>`</code> (one level deep only)
-- [ ] `iota`
+- [x] `iota` (including expressions like `iota * 2` and implicit repetition)
 
 ## Keywords
 
 - [x] `break`
 - [x] `case`
-- [ ] `chan`
+- [ ] `chan` (buffered channels via a `gochan<T>` shim; no `select`, unbuffered rendezvous approximated)
 - [x] `const`
 - [x] `continue`
 - [x] `default`
@@ -175,11 +206,11 @@ auto main() -> int
 - [x] `fallthrough`
 - [x] `for`
 - [x] `func`
-- [ ] `go`
+- [ ] `go` (detached `std::thread`; no scheduler)
 - [x] `goto`
 - [x] `if`
-- [x] `import` (partially)
-- [ ] `interface`
+- [x] `import` (local packages, single translation unit)
+- [x] `interface` (abstract classes, virtual dispatch; see DIFFERENCES.md)
 - [x] `map` (needs more testing)
 - [x] `package` (partially)
 - [x] `range`
@@ -189,22 +220,23 @@ auto main() -> int
 - [x] `switch`
 - [x] `type` (needs more testing)
 - [x] `var`
+- [x] `package` (name parsed; one package per directory)
 
 ## Standard library
 
 - [x] `fmt.Println`
 - [x] `fmt.Print`
-- [ ] `fmt.Printf` (partially)
-- [ ] `fmt.Sprintf`
+- [x] `fmt.Printf` (variadic; verbs `%v %s %d %f %t %x %g %q`)
+- [x] `fmt.Sprintf` (variadic, mixed argument types)
 - [x] `strings.Contains`
 - [x] `strings.HasPrefix`
-- [ ] `strings.HasSuffix`
-- [ ] `strings.Index`
-- [ ] `strings.Join`
+- [x] `strings.HasSuffix`
+- [x] `strings.Index`
+- [x] `strings.Join`
 - [ ] `strings.NewReader`
-- [ ] `strings.Replace`
-- [ ] `strings.Split`
-- [ ] `strings.SplitN`
+- [x] `strings.Replace` / `strings.ReplaceAll`
+- [x] `strings.Split`
+- [x] `strings.SplitN`
 - [x] `strings.TrimSpace`
 - [ ] All the rest
 
